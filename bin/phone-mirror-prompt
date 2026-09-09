@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import os
+import sys
+import socket
+import subprocess
+import threading
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton
+)
+from PyQt6.QtCore import Qt, pyqtSignal, QObject
+from PyQt6.QtGui import QIntValidator, QFont
+
+CONFIG_DIR = os.path.expanduser("~/.config/phone-mirror")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config")
+
+def load_config():
+    ip = "192.168.0.8"
+    port = "5555"
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("PHONE_IP="):
+                        ip = line.split("=", 1)[1].strip('"\' ')
+                    elif line.startswith("PHONE_PORT="):
+                        port = line.split("=", 1)[1].strip('"\' ')
+        except Exception:
+            pass
+    return ip, port
+
+def save_config(ip, port):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.write(f'# Configuration for phone-mirror\nPHONE_IP="{ip}"\nPHONE_PORT="{port}"\n')
+
+class WorkerSignals(QObject):
+    success = pyqtSignal(str)
+    failure = pyqtSignal(str)
+
+class ConnectPrompt(QWidget):
+    def __init__(self, current_ip, current_port):
+        super().__init__()
+        self.current_ip = current_ip
+        self.current_port = current_port
+        self.signals = WorkerSignals()
+        self.signals.success.connect(self.on_connect_success)
+        self.signals.failure.connect(self.on_connect_failure)
+        
+        parts = current_ip.split(".")
+        if len(parts) == 4:
+            self.base_subnet = ".".join(parts[:3]) + "."
+            self.suffix = parts[3]
+        else:
+            self.base_subnet = "192.168.0."
+            self.suffix = "8"
+            
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Conectar Teléfono")
+        self.setObjectName("phone-mirror-prompt")
+        self.setFixedSize(400, 210)
+        self.setWindowFlags(Qt.WindowType.Dialog)
+
+        self.setStyleSheet("""
+            QWidget#phone-mirror-prompt {
+                background-color: #171318;
+                border: 1px solid #362e38;
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #eae0e7;
+                font-family: 'JetBrains Mono', sans-serif;
+            }
+            QLineEdit {
+                background-color: #241e26;
+                color: #eae0e7;
+                border: 1px solid #4a3e4e;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 15px;
+                font-family: 'JetBrains Mono', monospace;
+                font-weight: bold;
+            }
+            QLineEdit:focus {
+                border: 1px solid #e9b5ef;
+                background-color: #2b232e;
+            }
+            QPushButton {
+                background-color: #2d2430;
+                color: #eae0e7;
+                border: 1px solid #4a3e4e;
+                border-radius: 8px;
+                padding: 7px 16px;
+                font-size: 13px;
+                font-family: 'JetBrains Mono', sans-serif;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #3b3040;
+                border: 1px solid #e9b5ef;
+            }
+            QPushButton#btnConnect {
+                background-color: #e9b5ef;
+                color: #1a111c;
+                border: 1px solid #e9b5ef;
+            }
+            QPushButton#btnConnect:hover {
+                background-color: #f3cbf8;
+            }
+            QPushButton#btnConnect:disabled {
+                background-color: #524153;
+                color: #8c7f8e;
+                border: 1px solid #524153;
+            }
+        """)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
+
+        title_label = QLabel("📱  No se pudo conectar al teléfono")
+        font_title = QFont("JetBrains Mono", 12, QFont.Weight.Bold)
+        title_label.setFont(font_title)
+        layout.addWidget(title_label)
+
+        sub_label = QLabel("Ingresá los últimos números de la IP:")
+        sub_label.setStyleSheet("color: #b0a3af; font-size: 12px;")
+        layout.addWidget(sub_label)
+
+        ip_row = QHBoxLayout()
+        ip_row.setSpacing(6)
+
+        prefix_label = QLabel(self.base_subnet)
+        prefix_label.setStyleSheet("""
+            background-color: #241e26;
+            color: #b0a3af;
+            border: 1px solid #4a3e4e;
+            border-radius: 8px;
+            padding: 6px 12px;
+            font-size: 15px;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: bold;
+        """)
+        ip_row.addWidget(prefix_label)
+
+        self.suffix_input = QLineEdit(self.suffix)
+        self.suffix_input.setValidator(QIntValidator(1, 254))
+        self.suffix_input.setMaxLength(3)
+        self.suffix_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.suffix_input.returnPressed.connect(self.start_connect)
+        ip_row.addWidget(self.suffix_input)
+
+        layout.addLayout(ip_row)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #ffb4ab; font-size: 11px;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch()
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.clicked.connect(self.close)
+        btn_row.addWidget(self.btn_cancel)
+
+        self.btn_connect = QPushButton("Conectar")
+        self.btn_connect.setObjectName("btnConnect")
+        self.btn_connect.clicked.connect(self.start_connect)
+        btn_row.addWidget(self.btn_connect)
+
+        layout.addLayout(btn_row)
+        self.setLayout(layout)
+
+        self.suffix_input.setFocus()
+        self.suffix_input.selectAll()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def start_connect(self):
+        suffix = self.suffix_input.text().strip()
+        if not suffix:
+            self.status_label.setText("Por favor ingresá los últimos dígitos.")
+            return
+
+        new_ip = f"{self.base_subnet}{suffix}"
+        self.status_label.setStyleSheet("color: #e9b5ef; font-size: 11px;")
+        self.status_label.setText(f"Probando conexión con {new_ip}...")
+        self.btn_connect.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
+        self.suffix_input.setEnabled(False)
+
+        threading.Thread(target=self._try_connect, args=(new_ip,), daemon=True).start()
+
+    def _try_connect(self, new_ip):
+        try:
+            # 1. Fast socket check (avoid hanging if IP is dead)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.2)
+            res = s.connect_ex((new_ip, int(self.current_port)))
+            s.close()
+            if res != 0:
+                self.signals.failure.emit(f"No hay respuesta en {new_ip}:{self.current_port}. ¿Tiene Wi-Fi?")
+                return
+
+            # 2. Reset and connect via ADB
+            subprocess.run(["adb", "disconnect", f"{new_ip}:{self.current_port}"], capture_output=True, timeout=1.5)
+            subprocess.run(["adb", "connect", f"{new_ip}:{self.current_port}"], capture_output=True, timeout=2.0)
+
+            # 3. Verify ADB state
+            check = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
+            is_connected = False
+            for line in check.stdout.splitlines():
+                if f"{new_ip}:{self.current_port}" in line and "device" in line:
+                    is_connected = True
+                    break
+
+            if is_connected:
+                self.signals.success.emit(new_ip)
+            else:
+                self.signals.failure.emit(f"Puerto abierto en {new_ip}, pero ADB no autorizó la conexión.")
+        except Exception as e:
+            self.signals.failure.emit(f"Error: {str(e)}")
+
+    def on_connect_success(self, new_ip):
+        save_config(new_ip, self.current_port)
+        subprocess.Popen([
+            "scrcpy",
+            "-s", f"{new_ip}:{self.current_port}",
+            "--window-title=Phone Mirror",
+            "--window-borderless",
+            "--stay-awake",
+            "--shortcut-mod=lalt"
+        ])
+        self.close()
+
+    def on_connect_failure(self, error_msg):
+        self.status_label.setStyleSheet("color: #ffb4ab; font-size: 11px;")
+        self.status_label.setText(error_msg)
+        self.btn_connect.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.suffix_input.setEnabled(True)
+        self.suffix_input.setFocus()
+        self.suffix_input.selectAll()
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("phone-mirror-prompt")
+    app.setDesktopFileName("phone-mirror-prompt")
+    
+    ip, port = load_config()
+    window = ConnectPrompt(ip, port)
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

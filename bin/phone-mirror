@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# phone-mirror - Screen mirroring for Android phone via scrcpy over Wi-Fi / ADB
+#
+
+# 1. Toggle behavior: If scrcpy or prompt is already running, toggle off and exit
+if pgrep -x "scrcpy" >/dev/null 2>&1 || pgrep -f "phone-mirror-prompt" >/dev/null 2>&1; then
+    pkill -x "scrcpy" 2>/dev/null || true
+    pkill -f "phone-mirror-prompt" 2>/dev/null || true
+    pkill -f "adb -s" 2>/dev/null || true
+    exit 0
+fi
+
+# 2. Configuration loading / defaults
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/phone-mirror"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+DEFAULT_PHONE_IP="192.168.0.8"
+DEFAULT_PHONE_PORT="5555"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<'CONF'
+# Configuration for phone-mirror
+PHONE_IP="192.168.0.8"
+PHONE_PORT="5555"
+CONF
+fi
+
+# shellcheck source=/dev/null
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+PHONE_IP="${1:-${PHONE_IP:-$DEFAULT_PHONE_IP}}"
+PHONE_PORT="${2:-${PHONE_PORT:-$DEFAULT_PHONE_PORT}}"
+
+# 3. Check if phone is genuinely reachable on the network via TCP port probe
+# (This avoids ADB's stale ghost socket bug when Wi-Fi drops)
+is_phone_reachable() {
+    timeout 0.6 bash -c "</dev/tcp/${PHONE_IP}/${PHONE_PORT}" >/dev/null 2>&1
+}
+
+if ! is_phone_reachable; then
+    # Phone is not reachable on this IP/port -> clear stale socket and open prompt
+    adb disconnect "${PHONE_IP}:${PHONE_PORT}" >/dev/null 2>&1 || true
+    exec /home/luki/.local/bin/phone-mirror-prompt
+fi
+
+# 4. Phone is reachable! Ensure ADB is connected to it
+is_adb_device_ready() {
+    adb devices 2>/dev/null | grep -E "${PHONE_IP}:${PHONE_PORT}[[:space:]]+device" >/dev/null 2>&1
+}
+
+if ! is_adb_device_ready; then
+    timeout 2 adb connect "${PHONE_IP}:${PHONE_PORT}" >/dev/null 2>&1 || true
+fi
+
+if ! is_adb_device_ready; then
+    # If ADB still fails to see it as device, open the prompt
+    exec /home/luki/.local/bin/phone-mirror-prompt
+fi
+
+# 5. Launch scrcpy with optimal flags:
+exec scrcpy \
+    -s "${PHONE_IP}:${PHONE_PORT}" \
+    --window-title="Phone Mirror" \
+    --window-borderless \
+    --stay-awake \
+    --shortcut-mod=lalt
