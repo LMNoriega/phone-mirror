@@ -40,6 +40,22 @@ is_phone_reachable() {
 }
 
 if ! is_phone_reachable; then
+    # If phone is not reachable via Wi-Fi yet, check if connected via USB cable
+    USB_DEV=$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /:/ {print $1; exit}')
+    if [ -n "$USB_DEV" ]; then
+        # Auto-detect IP from phone over USB
+        DETECTED_IP=$(adb -s "$USB_DEV" shell ip -f inet addr show wlan0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+        if [ -n "$DETECTED_IP" ]; then
+            PHONE_IP="$DETECTED_IP"
+            sed -i "s/^PHONE_IP=.*/PHONE_IP=\"${PHONE_IP}\"/" "$CONFIG_FILE" 2>/dev/null || true
+        fi
+        # Enable TCP/IP 5555 mode on device
+        adb -s "$USB_DEV" tcpip "${PHONE_PORT}" >/dev/null 2>&1 || true
+        sleep 1.2
+    fi
+fi
+
+if ! is_phone_reachable; then
     # Phone is not reachable on this IP/port -> clear stale socket and open prompt
     adb disconnect "${PHONE_IP}:${PHONE_PORT}" >/dev/null 2>&1 || true
     exec /home/luki/.local/bin/phone-mirror-prompt
