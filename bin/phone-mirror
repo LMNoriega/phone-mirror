@@ -12,17 +12,19 @@ if pgrep -x "scrcpy" >/dev/null 2>&1 || pgrep -f "phone-mirror-prompt" >/dev/nul
 fi
 
 # 2. Configuration loading / defaults
+REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/phone-mirror"
 CONFIG_FILE="$CONFIG_DIR/config"
 
-DEFAULT_PHONE_IP="192.168.0.8"
+DEFAULT_PHONE_IP="192.168.0.216"
 DEFAULT_PHONE_PORT="5555"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_FILE" <<'CONF'
 # Configuration for phone-mirror
-PHONE_IP="192.168.0.8"
+PHONE_IP="192.168.0.216"
 PHONE_PORT="5555"
 CONF
 fi
@@ -33,14 +35,49 @@ fi
 PHONE_IP="${1:-${PHONE_IP:-$DEFAULT_PHONE_IP}}"
 PHONE_PORT="${2:-${PHONE_PORT:-$DEFAULT_PHONE_PORT}}"
 
-# 3. Check if phone is genuinely reachable on the network via TCP port probe
-# (This avoids ADB's stale ghost socket bug when Wi-Fi drops)
+# Resolve prompt binary dynamically
+if [ -x "$SCRIPT_DIR/phone-mirror-prompt" ]; then
+    PROMPT_CMD="$SCRIPT_DIR/phone-mirror-prompt"
+elif [ -x "$HOME/.local/bin/phone-mirror-prompt" ]; then
+    PROMPT_CMD="$HOME/.local/bin/phone-mirror-prompt"
+else
+    PROMPT_CMD="phone-mirror-prompt"
+fi
+
+# 3. Check if phone is genuinely reachable on port 5555 via TCP probe
 is_phone_reachable() {
-    timeout 0.6 bash -c "</dev/tcp/${PHONE_IP}/${PHONE_PORT}" >/dev/null 2>&1
+    timeout 0.4 bash -c "</dev/tcp/${PHONE_IP}/${PHONE_PORT}" >/dev/null 2>&1
+}
+
+# Auto-discovery function via Android Wireless Debugging (mDNS / Avahi)
+discover_and_setup_wireless() {
+    local mdns_out disc_ip disc_port
+    mdns_out=$(timeout 1.5 avahi-browse -r -t _adb-tls-connect._tcp --resolve -p -d local 2>/dev/null | awk -F';' '$1=="=" && $3=="IPv4" {print $8, $9; exit}')
+    if [ -n "$mdns_out" ]; then
+        disc_ip=$(echo "$mdns_out" | awk '{print $1}')
+        disc_port=$(echo "$mdns_out" | awk '{print $2}')
+        if [ -n "$disc_ip" ] && [ -n "$disc_port" ]; then
+            # Connect to wireless debugging port and trigger tcpip 5555 over Wi-Fi
+            timeout 2 adb connect "${disc_ip}:${disc_port}" >/dev/null 2>&1 || true
+            sleep 0.2
+            adb -s "${disc_ip}:${disc_port}" tcpip "${PHONE_PORT}" >/dev/null 2>&1 || true
+            sleep 0.4
+            adb disconnect "${disc_ip}:${disc_port}" >/dev/null 2>&1 || true
+            PHONE_IP="$disc_ip"
+            sed -i "s/^PHONE_IP=.*/PHONE_IP=\"${PHONE_IP}\"/" "$CONFIG_FILE" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    return 1
 }
 
 if ! is_phone_reachable; then
-    # If phone is not reachable via Wi-Fi yet, check if connected via USB cable
+    # 1. Try Android Wireless Debugging discovery over Wi-Fi (No USB cable required!)
+    discover_and_setup_wireless || true
+fi
+
+if ! is_phone_reachable; then
+    # 2. If wireless discovery didn't find it, check if connected via USB cable
     USB_DEV=$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" && $1 !~ /:/ {print $1; exit}')
     if [ -n "$USB_DEV" ]; then
         # Auto-detect IP from phone over USB
@@ -51,14 +88,14 @@ if ! is_phone_reachable; then
         fi
         # Enable TCP/IP 5555 mode on device
         adb -s "$USB_DEV" tcpip "${PHONE_PORT}" >/dev/null 2>&1 || true
-        sleep 1.2
+        sleep 0.8
     fi
 fi
 
 if ! is_phone_reachable; then
     # Phone is not reachable on this IP/port -> clear stale socket and open prompt
     adb disconnect "${PHONE_IP}:${PHONE_PORT}" >/dev/null 2>&1 || true
-    exec /home/luki/.local/bin/phone-mirror-prompt
+    exec "$PROMPT_CMD"
 fi
 
 # 4. Phone is reachable! Ensure ADB is connected to it
@@ -71,8 +108,7 @@ if ! is_adb_device_ready; then
 fi
 
 if ! is_adb_device_ready; then
-    # If ADB still fails to see it as device, open the prompt
-    exec /home/luki/.local/bin/phone-mirror-prompt
+    exec "$PROMPT_CMD"
 fi
 
 # 5. Launch scrcpy with optimal flags:
